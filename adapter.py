@@ -123,7 +123,7 @@ class MattermostAdapter(BasePlatformAdapter):
         # allowing legitimate multi-turn threads. Can be overridden via
         # MATTERMOST_DEDUP_TTL env var (in seconds).
         dedup_ttl = int(os.getenv("MATTERMOST_DEDUP_TTL", "3600"))
-        self._dedup = MessageDeduplicator(ttl=dedup_ttl)
+        self._dedup = MessageDeduplicator(ttl_seconds=dedup_ttl)
 
     # ------------------------------------------------------------------
     # HTTP helpers
@@ -350,10 +350,11 @@ class MattermostAdapter(BasePlatformAdapter):
         self, chat_id: str, metadata: Optional[Dict[str, Any]] = None
     ) -> None:
         """Send a typing indicator."""
-        await self._api_post(
-            f"users/{self._bot_user_id}/typing",
-            {"channel_id": chat_id},
-        )
+        payload: Dict[str, Any] = {"channel_id": chat_id}
+        thread_id = (metadata or {}).get("thread_id")
+        if thread_id:
+            payload["parent_id"] = thread_id
+        await self._api_post(f"users/{self._bot_user_id}/typing", payload)
 
     # ── Reaction helpers (lifecycle hooks) ───────────────────────────
 
