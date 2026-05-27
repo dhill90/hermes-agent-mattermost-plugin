@@ -21,6 +21,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import aiohttp
+
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
@@ -135,7 +137,6 @@ class MattermostAdapter(BasePlatformAdapter):
 
     async def _api_get(self, path: str) -> Dict[str, Any]:
         """GET /api/v4/{path}."""
-        import aiohttp
         url = f"{self._base_url}/api/v4/{path.lstrip('/')}"
         try:
             async with self._session.get(url, headers=self._headers(), timeout=aiohttp.ClientTimeout(total=30)) as resp:
@@ -152,7 +153,6 @@ class MattermostAdapter(BasePlatformAdapter):
         self, path: str, payload: Dict[str, Any]
     ) -> Dict[str, Any]:
         """POST /api/v4/{path} with JSON body."""
-        import aiohttp
         url = f"{self._base_url}/api/v4/{path.lstrip('/')}"
         try:
             async with self._session.post(
@@ -172,7 +172,6 @@ class MattermostAdapter(BasePlatformAdapter):
         self, path: str, payload: Dict[str, Any]
     ) -> Dict[str, Any]:
         """PUT /api/v4/{path} with JSON body."""
-        import aiohttp
         url = f"{self._base_url}/api/v4/{path.lstrip('/')}"
         try:
             async with self._session.put(
@@ -191,8 +190,6 @@ class MattermostAdapter(BasePlatformAdapter):
         self, channel_id: str, file_data: bytes, filename: str, content_type: str = "application/octet-stream"
     ) -> Optional[str]:
         """Upload a file and return its file ID, or None on failure."""
-        import aiohttp
-
         url = f"{self._base_url}/api/v4/files"
         form = aiohttp.FormData()
         form.add_field("channel_id", channel_id)
@@ -218,8 +215,6 @@ class MattermostAdapter(BasePlatformAdapter):
 
     async def connect(self) -> bool:
         """Connect to Mattermost and start the WebSocket listener."""
-        import aiohttp
-
         if not self._base_url or not self._token:
             logger.error("Mattermost: URL or token not configured")
             return False
@@ -382,7 +377,6 @@ class MattermostAdapter(BasePlatformAdapter):
 
     async def _remove_reaction(self, post_id: str, emoji: str) -> bool:
         """Remove the bot's own emoji reaction from a post. Returns True on success."""
-        import aiohttp
         url = (
             f"{self._base_url}/api/v4/users/{self._bot_user_id}"
             f"/posts/{post_id}/reactions/{emoji}"
@@ -557,8 +551,6 @@ class MattermostAdapter(BasePlatformAdapter):
             logger.warning("Mattermost: blocked unsafe URL (SSRF protection)")
             return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata)
 
-        import aiohttp
-
         file_data = None
         ct = "application/octet-stream"
         fname = url.rsplit("/", 1)[-1].split("?")[0] or f"{kind}.png"
@@ -680,7 +672,6 @@ class MattermostAdapter(BasePlatformAdapter):
             return
 
         import mimetypes
-        import aiohttp
         from urllib.parse import unquote as _unquote
 
         CHUNK = 5  # Mattermost post file_ids cap
@@ -783,7 +774,6 @@ class MattermostAdapter(BasePlatformAdapter):
                     return
                 # Detect permanent auth/permission failures that will never
                 # succeed on retry — stop reconnecting instead of looping forever.
-                import aiohttp
                 err_str = str(exc).lower()
                 if isinstance(exc, aiohttp.WSServerHandshakeError) and exc.status in {401, 403}:
                     logger.error("Mattermost WS auth failed (HTTP %d) — stopping reconnect", exc.status)
@@ -824,8 +814,8 @@ class MattermostAdapter(BasePlatformAdapter):
                 return
 
             if raw_msg.type in {
-                raw_msg.type.TEXT,
-                raw_msg.type.BINARY,
+                aiohttp.WSMsgType.TEXT,
+                aiohttp.WSMsgType.BINARY,
             }:
                 try:
                     event = json.loads(raw_msg.data)
@@ -833,10 +823,10 @@ class MattermostAdapter(BasePlatformAdapter):
                     continue
                 await self._handle_ws_event(event)
             elif raw_msg.type in {
-                raw_msg.type.ERROR,
-                raw_msg.type.CLOSE,
-                raw_msg.type.CLOSING,
-                raw_msg.type.CLOSED,
+                aiohttp.WSMsgType.ERROR,
+                aiohttp.WSMsgType.CLOSE,
+                aiohttp.WSMsgType.CLOSING,
+                aiohttp.WSMsgType.CLOSED,
             }:
                 logger.info("Mattermost: WebSocket closed (%s)", raw_msg.type)
                 break
@@ -965,7 +955,6 @@ class MattermostAdapter(BasePlatformAdapter):
                 ext = Path(fname).suffix or ""
                 mime = file_info.get("mime_type", "application/octet-stream")
 
-                import aiohttp
                 dl_url = f"{self._base_url}/api/v4/files/{fid}"
                 async with self._session.get(
                     dl_url,
