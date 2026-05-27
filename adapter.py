@@ -27,6 +27,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SendResult,
 )
 
@@ -48,6 +49,16 @@ _CHANNEL_TYPE_MAP = {
 _RECONNECT_BASE_DELAY = 2.0
 _RECONNECT_MAX_DELAY = 60.0
 _RECONNECT_JITTER = 0.2
+
+# Platform hint for the agent on Mattermost threading behavior.
+# This tells the agent how to handle tool output in threaded contexts.
+MATTERMOST_PLATFORM_HINT = """
+**Mattermost Threading Behavior:**
+- When replying to a message in a thread, all agent responses (including tool output) should stay in that thread.
+- Tool progress messages and results must be sent to the same thread context to keep conversations organized.
+- If `MATTERMOST_REPLY_MODE=thread`, wrap long tool outputs to avoid leaking into the main channel.
+- Each message in a thread maintains its own context — tool results should reference the original question clearly.
+""".strip()
 
 
 def check_mattermost_requirements() -> bool:
@@ -96,8 +107,21 @@ class MattermostAdapter(BasePlatformAdapter):
             or os.getenv("MATTERMOST_REPLY_MODE", "off")
         ).lower()
 
-        # Dedup cache (prevent reprocessing)
-        self._dedup = MessageDeduplicator()
+        # Command prefix: "!" by default so Mattermost doesn't intercept
+        # unregistered slash commands.  The adapter rewrites the prefix to
+        # "/" before passing messages upstream, so gateway/run.py sees
+        # normal "/command" text and dispatches as usual.
+        self._command_prefix: str = (
+            config.extra.get("command_prefix", "")
+            or os.getenv("MATTERMOST_COMMAND_PREFIX", "!")
+        )
+
+        # Dedup cache (prevent reprocessing).
+        # TTL defaults to 3600 seconds (1 hour) — covers replay scenarios while
+        # allowing legitimate multi-turn threads. Can be overridden via
+        # MATTERMOST_DEDUP_TTL env var (in seconds).
+        dedup_ttl = int(os.getenv("MATTERMOST_DEDUP_TTL", "3600"))
+        self._dedup = MessageDeduplicator(ttl=dedup_ttl)
 
     # ------------------------------------------------------------------
     # HTTP helpers
@@ -273,12 +297,20 @@ class MattermostAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a message (or multiple chunks) to a channel."""
+        """Send a message (or multiple chunks) to a channel.
+
+        Respects thread_id in metadata to ensure messages stay in threads.
+        """
         if not content:
             return SendResult(success=True)
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, MAX_POST_LENGTH)
+
+        # Extract thread_id from metadata if present (takes precedence over reply_to)
+        thread_id = None
+        if metadata:
+            thread_id = metadata.get("thread_id")
 
         last_id = None
         for chunk in chunks:
@@ -286,12 +318,17 @@ class MattermostAdapter(BasePlatformAdapter):
                 "channel_id": chat_id,
                 "message": chunk,
             }
-            # Thread support: reply_to is the root post ID.
-            if reply_to and self._reply_mode == "thread":
+            # Thread support: multiple sources can indicate threading.
+            # Priority: metadata.thread_id > reply_to (when reply_mode=thread)
+            effective_thread = thread_id
+            if not effective_thread and reply_to and self._reply_mode == "thread":
                 # Ensure root_id points to the thread root, not a reply.
                 # Mattermost rejects non-root post IDs as root_id.
                 resolved_root = await self._resolve_root_id(reply_to)
-                payload["root_id"] = resolved_root
+                effective_thread = resolved_root
+
+            if effective_thread:
+                payload["root_id"] = effective_thread
 
             data = await self._api_post("posts", payload)
             if not data or "id" not in data:
@@ -323,6 +360,64 @@ class MattermostAdapter(BasePlatformAdapter):
             {"channel_id": chat_id},
         )
 
+    # ── Reaction helpers (lifecycle hooks) ───────────────────────────
+
+    @staticmethod
+    def _reactions_enabled() -> bool:
+        """Check if message reactions are enabled via config/env."""
+        return os.getenv("MATTERMOST_REACTIONS", "true").lower() not in ("false", "0", "no")
+
+    async def _add_reaction(self, post_id: str, emoji: str) -> bool:
+        """Add an emoji reaction to a post. Returns True on success."""
+        try:
+            data = await self._api_post("reactions", {
+                "post_id": post_id,
+                "emoji_name": emoji,
+                "user_id": self._bot_user_id,
+            })
+            return bool(data)
+        except Exception as exc:
+            logger.debug("Mattermost: add_reaction %s failed: %s", emoji, exc)
+            return False
+
+    async def _remove_reaction(self, post_id: str, emoji: str) -> bool:
+        """Remove the bot's own emoji reaction from a post. Returns True on success."""
+        import aiohttp
+        url = (
+            f"{self._base_url}/api/v4/users/{self._bot_user_id}"
+            f"/posts/{post_id}/reactions/{emoji}"
+        )
+        try:
+            async with self._session.delete(
+                url, headers=self._headers(),
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                return resp.status < 400
+        except Exception as exc:
+            logger.debug("Mattermost: remove_reaction %s failed: %s", emoji, exc)
+            return False
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """Add an in-progress reaction when message processing begins."""
+        if not self._reactions_enabled():
+            return
+        post_id = getattr(event, "message_id", None)
+        if post_id:
+            await self._add_reaction(post_id, "eyes")
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        """Swap the in-progress reaction for a final success/failure reaction."""
+        if not self._reactions_enabled():
+            return
+        post_id = getattr(event, "message_id", None)
+        if not post_id:
+            return
+        await self._remove_reaction(post_id, "eyes")
+        if outcome == ProcessingOutcome.SUCCESS:
+            await self._add_reaction(post_id, "white_check_mark")
+        elif outcome == ProcessingOutcome.FAILURE:
+            await self._add_reaction(post_id, "x")
+
     async def edit_message(
         self, chat_id: str, message_id: str, content: str, *, finalize: bool = False
     ) -> SendResult:
@@ -346,7 +441,7 @@ class MattermostAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Download an image and upload it as a file attachment."""
         return await self._send_url_as_file(
-            chat_id, image_url, caption, reply_to, "image"
+            chat_id, image_url, caption, reply_to, "image", metadata
         )
 
     async def send_image_file(
@@ -359,7 +454,7 @@ class MattermostAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Upload a local image file."""
         return await self._send_local_file(
-            chat_id, image_path, caption, reply_to
+            chat_id, image_path, caption, reply_to, metadata=metadata
         )
 
     async def send_document(
@@ -373,7 +468,7 @@ class MattermostAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Upload a local file as a document."""
         return await self._send_local_file(
-            chat_id, file_path, caption, reply_to, file_name
+            chat_id, file_path, caption, reply_to, file_name, metadata=metadata
         )
 
     async def send_voice(
@@ -386,7 +481,7 @@ class MattermostAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Upload an audio file."""
         return await self._send_local_file(
-            chat_id, audio_path, caption, reply_to
+            chat_id, audio_path, caption, reply_to, metadata=metadata
         )
 
     async def send_video(
@@ -399,7 +494,7 @@ class MattermostAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Upload a video file."""
         return await self._send_local_file(
-            chat_id, video_path, caption, reply_to
+            chat_id, video_path, caption, reply_to, metadata=metadata
         )
 
     def format_message(self, content: str) -> str:
@@ -412,6 +507,37 @@ class MattermostAdapter(BasePlatformAdapter):
         content = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"\2", content)
         return content
 
+    def transform_tool_result(
+        self, tool_name: str, tool_result: str, chat_id: str, thread_id: Optional[str] = None
+    ) -> str:
+        """Transform tool results to respect thread context.
+
+        When replying in a thread, wrap tool output to make it clear that
+        the result belongs to the threaded conversation, not the main channel.
+        This helps prevent tool output from appearing to "leak" into the main
+        channel and confusing readers.
+
+        Args:
+            tool_name: Name of the tool that was executed
+            tool_result: The output/result from the tool
+            chat_id: Channel ID where the result will be posted
+            thread_id: Thread root_id if this is a threaded reply
+
+        Returns:
+            Optionally transformed tool result string.
+        """
+        if not thread_id or not self._reply_mode == "thread":
+            # Not in a thread, return as-is
+            return tool_result
+
+        # For threaded replies, optionally wrap the result to make context clear.
+        # This is especially useful for long outputs.
+        if len(tool_result) > 500:
+            # For long outputs, add a subtle header to make it clear this is part of a thread
+            return f"**Tool: {tool_name}**\n\n{tool_result}"
+
+        return tool_result
+
     # ------------------------------------------------------------------
     # File helpers
     # ------------------------------------------------------------------
@@ -423,12 +549,13 @@ class MattermostAdapter(BasePlatformAdapter):
         caption: Optional[str],
         reply_to: Optional[str],
         kind: str = "file",
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Download a URL and upload it as a file attachment."""
         from tools.url_safety import is_safe_url
         if not is_safe_url(url):
             logger.warning("Mattermost: blocked unsafe URL (SSRF protection)")
-            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
+            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata)
 
         import aiohttp
 
@@ -446,7 +573,7 @@ class MattermostAdapter(BasePlatformAdapter):
                             await asyncio.sleep(1.5 * (attempt + 1))
                             continue
                     if resp.status >= 400:
-                        return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
+                        return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata)
                     file_data = await resp.read()
                     ct = resp.content_type or "application/octet-stream"
                     break
@@ -455,23 +582,31 @@ class MattermostAdapter(BasePlatformAdapter):
                     await asyncio.sleep(1.5 * (attempt + 1))
                     continue
                 logger.warning("Mattermost: failed to download %s after %d attempts: %s", url, attempt + 1, exc)
-                return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
+                return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata)
 
         if file_data is None:
             logger.warning("Mattermost: download returned no data for %s", url)
-            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
+            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata)
 
         file_id = await self._upload_file(chat_id, file_data, fname, ct)
         if not file_id:
-            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
+            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata)
 
         payload: Dict[str, Any] = {
             "channel_id": chat_id,
             "message": caption or "",
             "file_ids": [file_id],
         }
-        if reply_to and self._reply_mode == "thread":
-            payload["root_id"] = await self._resolve_root_id(reply_to)
+        
+        # Extract thread_id from metadata (takes precedence)
+        thread_id = None
+        if metadata:
+            thread_id = metadata.get("thread_id")
+        if not thread_id and reply_to and self._reply_mode == "thread":
+            thread_id = await self._resolve_root_id(reply_to)
+        
+        if thread_id:
+            payload["root_id"] = thread_id
 
         data = await self._api_post("posts", payload)
         if not data or "id" not in data:
@@ -485,6 +620,7 @@ class MattermostAdapter(BasePlatformAdapter):
         caption: Optional[str],
         reply_to: Optional[str],
         file_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Upload a local file and attach it to a post."""
         import mimetypes
@@ -509,8 +645,16 @@ class MattermostAdapter(BasePlatformAdapter):
             "message": caption or "",
             "file_ids": [file_id],
         }
-        if reply_to and self._reply_mode == "thread":
-            payload["root_id"] = await self._resolve_root_id(reply_to)
+        
+        # Extract thread_id from metadata (takes precedence)
+        thread_id = None
+        if metadata:
+            thread_id = metadata.get("thread_id")
+        if not thread_id and reply_to and self._reply_mode == "thread":
+            thread_id = await self._resolve_root_id(reply_to)
+        
+        if thread_id:
+            payload["root_id"] = thread_id
 
         data = await self._api_post("posts", payload)
         if not data or "id" not in data:
@@ -530,7 +674,7 @@ class MattermostAdapter(BasePlatformAdapter):
         uploaded individually (Mattermost's file API is one-at-a-time),
         then a single post is created referencing all uploaded file_ids
         at once. Batches larger than 5 are chunked. Falls back to the
-        base per-image loop on total failure.
+        base per-image loop on total failure. Respects thread_id in metadata.
         """
         if not images:
             return
@@ -541,6 +685,11 @@ class MattermostAdapter(BasePlatformAdapter):
 
         CHUNK = 5  # Mattermost post file_ids cap
         chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
+
+        # Extract thread_id from metadata if present
+        thread_id = None
+        if metadata:
+            thread_id = metadata.get("thread_id")
 
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
@@ -596,9 +745,13 @@ class MattermostAdapter(BasePlatformAdapter):
                     "message": "\n".join(caption_parts),
                     "file_ids": file_ids,
                 }
+                if thread_id:
+                    payload["root_id"] = thread_id
+
                 logger.info(
-                    "Mattermost: sending %d image(s) as single post (chunk %d/%d)",
+                    "Mattermost: sending %d image(s) as single post (chunk %d/%d)%s",
                     len(file_ids), chunk_idx + 1, len(chunks),
+                    f" in thread {thread_id[:8]}" if thread_id else "",
                 )
                 data = await self._api_post("posts", payload)
                 if not data or "id" not in data:
@@ -789,10 +942,16 @@ class MattermostAdapter(BasePlatformAdapter):
         # Thread support: if the post is in a thread, use root_id.
         thread_id = post.get("root_id") or None
 
-        # Determine message type.
+        # Determine message type and rewrite command prefix.
+        # Mattermost blocks unregistered "/" commands client-side, so we
+        # use a configurable prefix (default "!") and translate it to "/"
+        # here so the gateway's standard command dispatch works unchanged.
         file_ids = post.get("file_ids") or []
         msg_type = MessageType.TEXT
-        if message_text.startswith("/"):
+        if self._command_prefix and message_text.startswith(self._command_prefix):
+            message_text = "/" + message_text[len(self._command_prefix):]
+            msg_type = MessageType.COMMAND
+        elif message_text.startswith("/"):
             msg_type = MessageType.COMMAND
 
         # Download file attachments immediately (URLs require auth headers

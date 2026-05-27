@@ -1,5 +1,5 @@
-name: mattermost-platform
-label: Mattermost
+name: mattermost-custom
+label: Mattermost Custom
 kind: platform
 version: 1.0.0
 description: >
@@ -46,4 +46,16 @@ optional_env:
   - name: MATTERMOST_ALLOWED_CHANNELS
     description: "If set, the bot only responds in these channels (whitelist)."
     prompt: "Allowed channel IDs (comma-separated)"
+    password: false
+  - name: MATTERMOST_COMMAND_PREFIX
+    description: "Command prefix character (default '!'). Mattermost blocks unregistered '/' commands, so '!' is rewritten to '/' for gateway dispatch."
+    prompt: "Command prefix (default: !)"
+    password: false
+  - name: MATTERMOST_REACTIONS
+    description: "Enable message reactions (👀 on start, ✅/❌ on completion). Default: true."
+    prompt: "Enable reactions? (true/false)"
+    password: false
+  - name: MATTERMOST_DEDUP_TTL
+    description: "Message dedup cache TTL in seconds (default 3600). Prevents re-processing within this window while allowing multi-turn threads."
+    prompt: "Dedup TTL seconds (default: 3600)"
     password: false
