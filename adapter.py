@@ -502,37 +502,6 @@ class MattermostAdapter(BasePlatformAdapter):
         content = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"\2", content)
         return content
 
-    def transform_tool_result(
-        self, tool_name: str, tool_result: str, chat_id: str, thread_id: Optional[str] = None
-    ) -> str:
-        """Transform tool results to respect thread context.
-
-        When replying in a thread, wrap tool output to make it clear that
-        the result belongs to the threaded conversation, not the main channel.
-        This helps prevent tool output from appearing to "leak" into the main
-        channel and confusing readers.
-
-        Args:
-            tool_name: Name of the tool that was executed
-            tool_result: The output/result from the tool
-            chat_id: Channel ID where the result will be posted
-            thread_id: Thread root_id if this is a threaded reply
-
-        Returns:
-            Optionally transformed tool result string.
-        """
-        if not thread_id or not self._reply_mode == "thread":
-            # Not in a thread, return as-is
-            return tool_result
-
-        # For threaded replies, optionally wrap the result to make context clear.
-        # This is especially useful for long outputs.
-        if len(tool_result) > 500:
-            # For long outputs, add a subtle header to make it clear this is part of a thread
-            return f"**Tool: {tool_name}**\n\n{tool_result}"
-
-        return tool_result
-
     # ------------------------------------------------------------------
     # File helpers
     # ------------------------------------------------------------------
@@ -930,8 +899,17 @@ class MattermostAdapter(BasePlatformAdapter):
         sender_id = post.get("user_id", "")
         sender_name = data.get("sender_name", "").lstrip("@") or sender_id
 
-        # Thread support: if the post is in a thread, use root_id.
-        thread_id = post.get("root_id") or None
+        # Thread support: use the existing root_id if this is already a reply,
+        # otherwise (when reply_mode=thread) seed thread_id with the post's
+        # own ID so that tool-call messages sent before the first bot reply
+        # also land in the thread rather than the main channel.
+        existing_root = post.get("root_id")
+        if existing_root:
+            thread_id = existing_root
+        elif self._reply_mode == "thread":
+            thread_id = post_id
+        else:
+            thread_id = None
 
         # Determine message type and rewrite command prefix.
         # Mattermost blocks unregistered "/" commands client-side, so we
